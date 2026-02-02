@@ -3,9 +3,19 @@ import numpy as np
 import pandas as pd
 import joblib as jbl
 
-def get_full_benchmark_mmlu_pro():
+
+def make_predictions_irt_mmlu_pro(index):
+    y = jbl.load("Data/mmlu_pro.jbl")[index]
+    f = np.load("Data/irt2p_mmlu_pro.npy")
+    return f,y 
+
+def make_predictions_mean_mmlu_pro(index):
     data = jbl.load("Data/mmlu_pro.jbl")
-    return data
+    y = data[index]
+    f = data.mean(0)
+    return f,y 
+
+
 
 
 def get_all_targets_mmlu():
@@ -32,23 +42,59 @@ def make_predictions_judge(model):
     y = (targets*gpt).sum(1)
     return f,y 
 
+def make_predictions_judge_unc(model):
+    preds = get_all_predictions_mmlu("llama3.1")
+    targets = get_all_targets_mmlu()
+    gpt = get_all_predictions_mmlu(model)
+    
+    f = (preds).max(1)
+    y = (targets*gpt).sum(1)
+    return f,y 
+
+
+def make_predictions_difficulty(model):
+    targets = get_all_targets_mmlu()
+    gpt = get_all_predictions_mmlu(model)
+    
+    f = np.load("Data/difficulty_llama70b.npy")
+    y = (targets*gpt).sum(1)
+    return f,y 
+
+def make_predictions_subtasks(model):
+    targets = get_all_targets_mmlu()
+    gpt = get_all_predictions_mmlu(model)
+    
+    f = np.load("Data/mmlu_subtasks.npy")
+    y = (targets*gpt).sum(1)
+    return f,y 
 
 
 
 def get_ppi_data(f,y,n=100,k=100,with_replacement=False):
-    assert not with_replacement, "Not implemented"
     keys = np.random.random((k, len(f)))
+    if not with_replacement:
+        idx = np.argpartition(keys, kth=n-1, axis=1)     # O(k*N)
+        sub_idx  = idx[:, :n]
+        comp_idx = idx[:, n:]
+
+
+        subs_f = np.take(f, sub_idx).T     # shape (k, n)
+        comps_f = np.take(f, comp_idx).T
+
+        subs_y = np.take(y, sub_idx).T     # shape (k, n)
     
-    idx = np.argpartition(keys, kth=n-1, axis=1)     # O(k*N)
-    sub_idx  = idx[:, :n]
-    comp_idx = idx[:, n:]
+    if with_replacement:
+        # sample k groups of size n, independently, with replacement
+        sub_idx = np.random.randint(0, len(f), size=(k, n))  # shape (k, n)
+
+        subs_f = np.take(f, sub_idx).T                  # (n, k) -> transpose matches original pattern
+        subs_y = np.take(y, sub_idx).T                  # (n, k)
+
+        # "complement" isn't well-defined with replacement (duplicates, no strict complement).
+        # Return the full dataset replicated per group for compatibility: shape (N, k).
+        comps_f = np.broadcast_to(f, (k, len(f))).T          # (N, k)
     
-    
-    subs_f = np.take(f, sub_idx).T     # shape (k, n)
-    comps_f = np.take(f, comp_idx).T
-    
-    subs_y = np.take(y, sub_idx).T     # shape (k, n)
-    return subs_f,comps_f,subs_y,np.mean(y)
+    return subs_f,comps_f,subs_y,float(np.mean(y))
 
 def subsamples_n_k(x, n, k):
     """Return (k, n) array: k independent subsamples of size n from 1D x, each without replacement."""
@@ -109,8 +155,10 @@ def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default"):
     #Then: Batched calculations of the exploration indexes 
     
     masks = [f == value for value in np.unique(f)]
+    assert len(masks) * 2 < n, "n not large enough for warmup phase"
+    sizes = [mask.sum() for mask in masks]
     #assert min([mask.sum() for mask in masks]) > n or with_replacement, str(n)+"  "+str(min([mask.sum() for mask in masks]))
-    weights = [mask.sum() / len(f)  for mask in masks]
+    weights = [size / len(f)  for size in sizes]
     
     #For each arm: pre-sample draws without replacement
     #rs = [np.random.choice(y[masks[i]], size = (n,k) )  for i in range(len(masks)) ]
@@ -118,18 +166,26 @@ def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default"):
         rs = [np.random.choice(y[masks[i]], size = (n,k) )  for i in range(len(masks)) ]
     else:
         rs = [shuffled_copies(y[masks[i]],k)  for i in range(len(masks)) ]
-        
-    # Start by sampling twice per arm 
-    ns = np.zeros((len(masks),k),dtype=int) + 2
+               
+    # Start by sampling twice per arm, unless it only has a single element. 
+    ns = np.zeros((len(masks),k),dtype=int) + 1 
+    for i in range(len(masks)):
+        if sizes[i] > 1 or not with_replacement:
+            ns[i] += 1 
     
-    sums = [rs[i][:2].sum(0) for i in range(len(masks))]
+    sums = [rs[i][:ns[i,0]].sum(0) for i in range(len(masks))] #All entries at i are copies here, just pick the first one
     
     idx = np.arange(k)
     
-    for _ in range(max(n - 2*len(masks), 0)):
+    for _ in range(max(n - ns[:,0].sum(), 0)):
         stds = [np.sqrt((sums[i] - (sums[i])**2 / ns[i]) / (ns[i]-1)) for i in range(len(masks))]
-        bs = [bound(stds[i], ns[i], weights[i], beta)  for i in range(len(masks))]
-        best_b = np.argmax(np.stack(bs),0) #One per parallel run!
+        bs = np.stack([bound(stds[i], ns[i], weights[i], beta)  for i in range(len(masks))]) # num_masks times k runs
+        
+        if with_replacement: #Ensure we don't sample from any "exhausted" strata
+            samples_left = np.expand_dims(np.array(sizes),1) > ns
+            bs[~samples_left] = -np.inf
+        
+        best_b = np.argmax(bs,0) #One per parallel run!
         
         chooses = [best_b == i for i in range(len(masks))]
         
@@ -147,8 +203,12 @@ def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default"):
 
 def simple_strat_k(f,y,n=100,k=1024,with_replacement=False):
     masks = [f == value for value in np.unique(f)]
-    weights = [mask.sum() / len(f)  for mask in masks]
-    samples = [np.floor(n*weight) for weight in weights]
+    weights = np.array([mask.sum() / len(f)  for mask in masks])
+    
+    
+    q = (n - len(weights)) * weights
+    samples = 1 + np.floor(q).astype(int)  # Guarantee one sample per stratum
+    samples[np.argsort(-(q - np.floor(q)))[: n - samples.sum()]] += 1 #Reassign rather than rounding down
     assert np.all([masks[i].sum() >= samples[i] for i in range(len(masks))]) or with_replacement, str(n)+"  "+str(min([mask.sum() for mask in masks]))
     
     if with_replacement:
@@ -163,4 +223,31 @@ def simple_strat_k(f,y,n=100,k=1024,with_replacement=False):
     return np.mean((est-np.mean(y))**2)*n 
 
 def round_strata(f,n_strata):
+    f = (f - np.min(f)) / (np.max(f)-np.min(f))  #Normalize...
     return np.clip(np.rint(f * (n_strata-1)) / (n_strata-1), 0.0, 1.0)
+
+
+
+def tpr(x,y):
+    return (x*y).sum() / y.sum()
+
+def tnr(x,y):
+    return ((1-x)*(1-y)).sum() / (1-y).sum()
+
+def var_strat(f,y):
+    f_cal = f.copy().astype(float)
+    for value in np.unique(f):
+        f_cal[f==value] = y[f==value].mean()
+    return (f_cal-y).var()
+
+
+def var_adaptive_strat(f,y):
+    optimized_variance = 0.0
+    for value in np.unique(f):
+        prob = (f == value).mean()
+        conditional_std = y[f == value].std()
+        optimized_variance += prob*conditional_std 
+    return optimized_variance**2
+    
+
+
