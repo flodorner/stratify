@@ -16,6 +16,40 @@ def make_predictions_mean_mmlu_pro(index):
     return f,y 
 
 
+def make_predictions_full_mmlu_pro(index):
+    data = jbl.load("Data/mmlu_pro.jbl")
+    y = data[index]
+    f = np.vstack((data[:index], data[index+1:])).T
+    return f,y 
+
+
+def make_predictions_diff_omnimath(index):
+    data = np.load("Data/omnimath.npy")
+    y = data[index]
+    f = np.load("Data/diffs_omnimath.npy")
+    return f,y 
+
+
+def make_predictions_domain_omnimath(index):
+    data = np.load("Data/omnimath.npy")
+    y = data[index]
+    f = np.load("Data/domains_omnimath.npy")
+    return f,y 
+
+
+def make_predictions_cross_omnimath(index):
+    data = np.load("Data/omnimath.npy")
+    y = data[index]
+    
+    diffs = np.load("Data/diffs_omnimath.npy")
+    diffs = np.round(diffs)/10
+    domains = np.load("Data/domains_omnimath.npy")
+    
+    f = np.array([domains[i]+str(diffs[i]) for i in range(len(y))])
+    return f,y
+    
+    
+
 
 
 def get_all_targets_mmlu():
@@ -96,6 +130,21 @@ def get_ppi_data(f,y,n=100,k=100,with_replacement=False):
     
     return subs_f,comps_f,subs_y,float(np.mean(y))
 
+
+def get_base_data(f,y,n=100,k=100,with_replacement=False):
+    keys = np.random.random((k, len(f)))
+    if not with_replacement:
+        idx = np.argpartition(keys, kth=n-1, axis=1)     # O(k*N)
+        sub_idx  = idx[:, :n]
+        subs_y = np.take(y, sub_idx).T     # shape (k, n)
+    
+    if with_replacement:
+        # sample k groups of size n, independently, with replacement
+        sub_idx = np.random.randint(0, len(f), size=(k, n))  # shape (k, n)
+        subs_y = np.take(y, sub_idx).T                  # (n, k)
+    
+    return subs_y,float(np.mean(y))
+
 def subsamples_n_k(x, n, k):
     """Return (k, n) array: k independent subsamples of size n from 1D x, each without replacement."""
     x = np.asarray(x)
@@ -119,7 +168,7 @@ def shuffled_copies(a, k):
 
 
 def baseline(f,y, n=100, k=1000,with_replacement=False):
-    f_l, f_u, y_l ,target = get_ppi_data(f,y,n=n,k=k,with_replacement=with_replacement)
+    y_l ,target = get_base_data(f,y,n=n,k=k,with_replacement=with_replacement)
     sum_y_l  = (y_l).sum(axis=0)
     mean_y_l = sum_y_l / n
     est = mean_y_l
@@ -144,12 +193,17 @@ def ppi_k(f,y, n=100, k=1000,with_replacement=False):
     return np.mean((est-target)**2)*n 
 
 def bound(sd,step,weight,beta):
+    sd_upper_bound = sd + 2*beta / np.sqrt(step)
+    print(sd_upper_bound)
     return weight * (sd + 2*beta / np.sqrt(step)) / step 
 
-def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default"):    
+def bound_capped(sd,step,weight,beta):
+    sd_upper_bound = sd + 2*beta / np.sqrt(step)
+    return weight * (np.minimum(sd_upper_bound,0.5)) / step 
+
+def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default",cap_bound=False,beta_const=4.5):    
     if beta == "default":
-        beta = np.sqrt(4.5*np.log(n))
-        
+        beta = np.sqrt(beta_const*np.log(n))
     #Warmup?!
     #Idea: Every step does index-based stratum queries (How to parallelize?)
     #Then: Batched calculations of the exploration indexes 
@@ -170,7 +224,7 @@ def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default"):
     # Start by sampling twice per arm, unless it only has a single element. 
     ns = np.zeros((len(masks),k),dtype=int) + 1 
     for i in range(len(masks)):
-        if sizes[i] > 1 or not with_replacement:
+        if sizes[i] > 1 or with_replacement:
             ns[i] += 1 
     
     sums = [rs[i][:ns[i,0]].sum(0) for i in range(len(masks))] #All entries at i are copies here, just pick the first one
@@ -179,9 +233,11 @@ def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default"):
     
     for _ in range(max(n - ns[:,0].sum(), 0)):
         stds = [np.sqrt((sums[i] - (sums[i])**2 / ns[i]) / (ns[i]-1)) for i in range(len(masks))]
-        bs = np.stack([bound(stds[i], ns[i], weights[i], beta)  for i in range(len(masks))]) # num_masks times k runs
-        
-        if with_replacement: #Ensure we don't sample from any "exhausted" strata
+        if not cap_bound:
+            bs = np.stack([bound(stds[i], ns[i], weights[i], beta)  for i in range(len(masks))]) # num_masks times k runs
+        else:
+            bs = np.stack([bound_capped(stds[i], ns[i], weights[i], beta)  for i in range(len(masks))])
+        if not with_replacement: #Ensure we don't sample from any "exhausted" strata
             samples_left = np.expand_dims(np.array(sizes),1) > ns
             bs[~samples_left] = -np.inf
         
@@ -235,7 +291,7 @@ def tnr(x,y):
     return ((1-x)*(1-y)).sum() / (1-y).sum()
 
 def var_strat(f,y):
-    f_cal = f.copy().astype(float)
+    f_cal = np.zeros_like(f,dtype=float)
     for value in np.unique(f):
         f_cal[f==value] = y[f==value].mean()
     return (f_cal-y).var()
