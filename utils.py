@@ -4,6 +4,17 @@ import pandas as pd
 import joblib as jbl
 
 
+
+def make_predictions_active(model1,model2):
+    scores1 = np.load("Data/gpqa_diamond/"+model1+".npy")
+    scores2 = np.load("Data/gpqa_diamond/"+model2+".npy")
+    y = scores1-scores2 
+    try:
+        f = np.load("Data/gpqa_diamond/"+model1+"_vs_"+model2+".npy")
+    except:
+        f = np.load("Data/gpqa_diamond/"+model2+"_vs_"+model1+".npy")
+    return f,y 
+
 def make_predictions_irt_mmlu_pro(index):
     y = jbl.load("Data/mmlu_pro.jbl")[index]
     f = np.load("Data/irt2p_mmlu_pro.npy")
@@ -194,7 +205,6 @@ def ppi_k(f,y, n=100, k=1000,with_replacement=False):
 
 def bound(sd,step,weight,beta):
     sd_upper_bound = sd + 2*beta / np.sqrt(step)
-    print(sd_upper_bound)
     return weight * (sd + 2*beta / np.sqrt(step)) / step 
 
 def bound_capped(sd,step,weight,beta):
@@ -228,11 +238,13 @@ def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default",cap_
             ns[i] += 1 
     
     sums = [rs[i][:ns[i,0]].sum(0) for i in range(len(masks))] #All entries at i are copies here, just pick the first one
+    sums2 = [ (rs[i][:ns[i,0]]**2).sum(0) for i in range(len(masks)) ]
     
     idx = np.arange(k)
     
     for _ in range(max(n - ns[:,0].sum(), 0)):
-        stds = [np.sqrt((sums[i] - (sums[i])**2 / ns[i]) / (ns[i]-1)) for i in range(len(masks))]
+        stds = [np.sqrt((sums2[i] - (sums[i]**2) / ns[i]) / (ns[i] - 1)) for i in range(len(masks))]
+
         if not cap_bound:
             bs = np.stack([bound(stds[i], ns[i], weights[i], beta)  for i in range(len(masks))]) # num_masks times k runs
         else:
@@ -249,8 +261,12 @@ def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default",cap_
             
             if chooses[i].any():
                 index = idx[chooses[i]]
-                sums[i][index] += rs[i][ns[i][index],index]
+                x = rs[i][ns[i][index], index]
+                sums[i][index]  += x
+                sums2[i][index] += x**2
+                #sums[i][index] += rs[i][ns[i][index],index]
                 ns[i][index] += 1
+                
     
     means = [sums[i]/ns[i] for i in range(len(masks))]
     est = np.stack([weights[i]*means[i] for i in range(len(masks))]).sum(0)
@@ -271,12 +287,60 @@ def simple_strat_k(f,y,n=100,k=1024,with_replacement=False):
         rs = [np.random.choice(y[masks[i]], size = (n,k) )  for i in range(len(masks)) ]
     else:
         rs = [shuffled_copies(y[masks[i]],k)  for i in range(len(masks)) ]
-    i=0
     
     means = [rs[i][:int(samples[i]),:].sum(0)/samples[i] for i in range(len(masks))]
     
     est = np.stack([weights[i]*means[i] for i in range(len(masks))]).sum(0)
     return np.mean((est-np.mean(y))**2)*n 
+
+
+def two_stage_strat_k(f,y,n=100,k=1024,with_replacement=False,beta=10):
+    #MAIN ISSUE: Too aggressive. When there's zero variance after the warmup, we just never sample again....
+    masks = [f == value for value in np.unique(f)]
+    weights = np.array([mask.sum() / len(f)  for mask in masks])
+    
+    
+    if with_replacement:
+        rs = [np.random.choice(y[masks[i]], size = (n,k) )  for i in range(len(masks)) ]
+    else:
+        rs = [shuffled_copies(y[masks[i]],k)  for i in range(len(masks)) ]
+    
+    n_pilot = np.sqrt(n) * beta / 2 
+    pilot_samples_per_mask = int(n_pilot // len(masks))
+    
+    #pilot_samples_per_mask = n // (2*len(masks))
+    assert pilot_samples_per_mask > 1
+    n_remaining = n - pilot_samples_per_mask * len(masks) 
+    sds = [np.std(rs[i][:pilot_samples_per_mask,:],axis=0,ddof=1) for i in range(len(masks))] 
+    #print("real",[np.std(y[masks[i]]) for i in range(len(masks))],[sd.mean() for sd in sds])
+    sample_weights = np.array([sds[i] * weights[i] for i in range(len(masks))])
+    sample_weights_total = sample_weights.sum(0)
+    sample_weights = sample_weights/sample_weights_total
+    #print(sample_weights)
+    
+    
+    samples = [ np.floor(sample_weights[i] * n_remaining).astype(int) + pilot_samples_per_mask  for i in range(len(masks)) ]
+    #+ pilot_samples_per_mask 
+    # This is of shape strata * k. TODO: Reassign the things lost rounding. 
+    # TODO: Add assert to check in the without replacement case 
+    
+    means = []
+    for i in range(len(masks)):
+        A = rs[i] 
+        t = samples[i]          # shape (k,)
+
+        # Build prefix sums with a zero row so that t=0 works naturally.
+        # prefix[r, i] = sum(A[:r, i])
+        prefix = np.vstack([np.zeros((1, k), dtype=A.dtype), np.cumsum(A, axis=0)])
+
+        # Vectorized gather: result[i] = prefix[t[i], i]
+        means.append(prefix[t, np.arange(k)]/t)  
+    #means = [rs[i][:int(samples[i]),:].sum(0)/samples[i] for i in range(len(masks))]
+    
+    
+    est = np.stack([weights[i]*means[i] for i in range(len(masks))]).sum(0)
+    return np.mean((est-np.mean(y))**2)*n 
+
 
 def round_strata(f,n_strata):
     f = (f - np.min(f)) / (np.max(f)-np.min(f))  #Normalize...
