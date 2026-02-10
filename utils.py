@@ -9,10 +9,32 @@ def make_predictions_active(model1,model2):
     scores1 = np.load("Data/gpqa_diamond/"+model1+".npy")
     scores2 = np.load("Data/gpqa_diamond/"+model2+".npy")
     y = scores1-scores2 
+
     try:
-        f = np.load("Data/gpqa_diamond/"+model1+"_vs_"+model2+".npy")
+        f = np.load("Data/gpqa_diamond/scout_instruct_cot"+model1+"_vs_"+model2+".npy")
     except:
-        f = np.load("Data/gpqa_diamond/"+model2+"_vs_"+model1+".npy")
+        f = np.load("Data/gpqa_diamond/scout_instruct_cot"+model2+"_vs_"+model1+".npy")
+    
+    return f,y 
+
+def make_predictions_active_fictional(model1,model2):
+    scores1 = np.load("Data/gpqa_diamond/"+model1+".npy")
+    scores2 = np.load("Data/gpqa_diamond/"+model2+".npy")
+    y = scores1-scores2 
+    
+    try:
+        f = np.load("Data/gpqa_diamond/scout_instruct_cot"+model1+"_vs_"+model2+".npy")
+    except:
+        f = np.load("Data/gpqa_diamond/scout_instruct_cot"+model2+"_vs_"+model1+".npy")
+    
+    f[y!=0] = 0 #If models actually disagree, never say that they agree... 
+    return f,y 
+
+def make_predictions_active_perfect(model1,model2):
+    scores1 = np.load("Data/gpqa_diamond/"+model1+".npy")
+    scores2 = np.load("Data/gpqa_diamond/"+model2+".npy")
+    y = scores1-scores2 
+    f = np.abs(scores1-scores2)
     return f,y 
 
 def make_predictions_irt_mmlu_pro(index):
@@ -211,7 +233,7 @@ def bound_capped(sd,step,weight,beta):
     sd_upper_bound = sd + 2*beta / np.sqrt(step)
     return weight * (np.minimum(sd_upper_bound,0.5)) / step 
 
-def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default",cap_bound=False,beta_const=4.5):    
+def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default",cap_bound=False,beta_const=4.5,batched=None):    
     if beta == "default":
         beta = np.sqrt(beta_const*np.log(n))
     #Warmup?!
@@ -242,8 +264,9 @@ def adaptive_strat_k(f,y,n=100,k=1024,with_replacement=False,beta="default",cap_
     
     idx = np.arange(k)
     
-    for _ in range(max(n - ns[:,0].sum(), 0)):
-        stds = [np.sqrt((sums2[i] - (sums[i]**2) / ns[i]) / (ns[i] - 1)) for i in range(len(masks))]
+    for step in range(max(n - ns[:,0].sum(), 0)):
+        if batched is None or (step%batched)==0: #Simple batching strategy: Only update the stds from time to time. 
+            stds = [np.sqrt((sums2[i] - (sums[i]**2) / ns[i]) / (ns[i] - 1)) for i in range(len(masks))]
 
         if not cap_bound:
             bs = np.stack([bound(stds[i], ns[i], weights[i], beta)  for i in range(len(masks))]) # num_masks times k runs
